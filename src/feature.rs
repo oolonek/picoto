@@ -6,6 +6,12 @@ use crate::spectrum::{self, Peak, Spectrum};
 
 const BIN_WIDTH: f64 = 0.01;
 
+pub(crate) const ISOTOPE_SPACING: f64 = 1.003_355;
+
+pub(crate) fn isotope_tolerance(target: f64) -> f64 {
+    (target * 10e-6).max(0.004)
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub min_height: f64,
@@ -157,8 +163,8 @@ fn isotope_envelope(peaks: &[Peak], mono: Peak) -> ([Peak; 4], usize) {
     let mut result = [mono; 4];
     let mut count = 1;
     for n in 1..=3 {
-        let target = mono.mz + n as f64 * 1.003_355;
-        if let Some(peak) = nearest(peaks, target, (target * 10e-6).max(0.004)) {
+        let target = mono.mz + n as f64 * ISOTOPE_SPACING;
+        if let Some(peak) = nearest(peaks, target, isotope_tolerance(target)) {
             if peak.intensity > 0.0 {
                 result[count] = peak;
                 count += 1;

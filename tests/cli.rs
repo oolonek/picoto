@@ -217,6 +217,160 @@ fn recursive_parallel_batch_preserves_nested_file_identity() {
 }
 
 #[test]
+fn files_from_processes_only_listed_raw_files_at_their_relative_output_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("raw");
+    let output = dir.path().join("output");
+    let list = dir.path().join("selected.txt");
+    for folder in ["pos", "neg", "skipped"] {
+        fs::create_dir_all(source.join(folder)).unwrap();
+        input(&source.join(folder).join("run.mzXML"), false, false);
+    }
+    fs::write(&list, "neg/run.mzXML\npos/run.mzXML\n").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_picoto"))
+        .arg(&source)
+        .arg(&output)
+        .arg("--files-from")
+        .arg(&list)
+        .args(["--jobs", "2", "--min-height", "10"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for folder in ["neg", "pos"] {
+        let mgf = fs::read_to_string(output.join(folder).join("run_sirius.mgf")).unwrap();
+        assert!(mgf.contains("MSLEVEL=2"), "{mgf}");
+        assert!(output.join(folder).join("run_features.tsv").exists());
+    }
+    assert!(!output.join("skipped").exists());
+    assert!(!output.join("neg").join("run.mzXML").exists());
+}
+
+#[test]
+fn files_from_rejects_invalid_lists_before_processing_any_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("raw");
+    fs::create_dir_all(&source).unwrap();
+    input(&source.join("run.mzXML"), false, false);
+    input(&source.join("run.mzML"), false, false);
+    fs::create_dir(source.join("folder.mzXML")).unwrap();
+    fs::write(source.join("note.txt"), "not raw").unwrap();
+    let list = dir.path().join("selected.txt");
+    let outside = dir.path().join("outside.mzXML");
+    input(&outside, false, false);
+    let invalid = [
+        ("empty", String::new(), "no mzXML/mzML files"),
+        ("absolute", format!("run.mzXML\n{}\n", outside.display()), "relative"),
+        ("traversal", "run.mzXML\n../outside.mzXML\n".into(), "parent"),
+        ("duplicate", "run.mzXML\nrun.mzXML\n".into(), "duplicate"),
+        ("unsupported", "run.mzXML\nnote.txt\n".into(), "mzXML/mzML"),
+        ("directory", "run.mzXML\nfolder.mzXML\n".into(), "file"),
+        ("missing", "run.mzXML\nmissing.mzXML\n".into(), "file"),
+        (
+            "collision",
+            "run.mzXML\nrun.mzML\n".into(),
+            "overwrite one output",
+        ),
+    ];
+    for (case, entries, message) in invalid {
+        fs::write(&list, entries).unwrap();
+        let output = dir.path().join(format!("out-{case}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_picoto"))
+            .arg(&source)
+            .arg(&output)
+            .arg("--files-from")
+            .arg(&list)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{case}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(message),
+            "{case}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists(), "{case} processed before validation");
+    }
+    fs::write(&list, [b"run.mzXML\n".as_slice(), b"\xff.mzXML\n"].concat()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_picoto"))
+        .arg(&source)
+        .arg(dir.path().join("out-non-utf8"))
+        .arg("--files-from")
+        .arg(&list)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("UTF-8"));
+    assert!(!dir.path().join("out-non-utf8").exists());
+    fs::write(&list, "run.mzXML\n").unwrap();
+    let output = dir.path().join("out-file-input");
+    let result = Command::new(env!("CARGO_BIN_EXE_picoto"))
+        .arg(source.join("run.mzXML"))
+        .arg(&output)
+        .arg("--files-from")
+        .arg(&list)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("directory input"));
+    assert!(!output.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn files_from_rejects_symlinks_escaping_the_input_root() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("raw");
+    fs::create_dir_all(&source).unwrap();
+    input(&source.join("run.mzXML"), false, false);
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    input(&outside.join("escape.mzXML"), false, false);
+    symlink(outside.join("escape.mzXML"), source.join("escape.mzXML")).unwrap();
+    symlink(&outside, source.join("outside-dir")).unwrap();
+    symlink(source.join("run.mzXML"), source.join("alias.mzXML")).unwrap();
+    let list = dir.path().join("selected.txt");
+    for (case, path) in ["escape.mzXML", "outside-dir/escape.mzXML"]
+        .into_iter()
+        .enumerate()
+    {
+        fs::write(&list, format!("run.mzXML\n{path}\n")).unwrap();
+        let output = dir.path().join(format!("out-symlink-{case}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_picoto"))
+            .arg(&source)
+            .arg(&output)
+            .arg("--files-from")
+            .arg(&list)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{path}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("outside"),
+            "{path}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+    }
+    fs::write(&list, "run.mzXML\nalias.mzXML\n").unwrap();
+    let output = dir.path().join("out-alias");
+    let result = Command::new(env!("CARGO_BIN_EXE_picoto"))
+        .arg(&source)
+        .arg(&output)
+        .arg("--files-from")
+        .arg(&list)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("duplicate"));
+    assert!(!output.exists());
+}
+
+#[test]
 fn two_separated_chromatographic_apices_at_one_mz_remain_distinct_features() {
     let dir = tempfile::tempdir().unwrap();
     let raw = dir.path().join("isomers.mzXML");

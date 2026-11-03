@@ -1,6 +1,11 @@
 mod explore;
 mod explore_data;
+mod explore_features;
+mod explore_file_panel;
+mod explore_files;
+mod explore_loading;
 mod feature;
+mod feature_list_view;
 mod feature_table;
 mod feature_view;
 mod inspect;
@@ -8,6 +13,8 @@ mod mzml;
 mod mzxml;
 mod output;
 mod spectrum;
+mod spectrum_isotopes;
+mod spectrum_plot;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
@@ -18,7 +25,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::{BufWriter, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
@@ -47,6 +54,9 @@ struct Cli {
     input: PathBuf,
     /// Root for per-file MGF, accepted feature-list TSV, and feature audit TSV outputs
     output: PathBuf,
+    /// Process only newline-separated relative raw paths from this UTF-8 file (directory input only)
+    #[arg(long)]
+    files_from: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputMode::Paired)]
     mode: OutputMode,
     #[arg(long, default_value_t = 4)]
@@ -115,10 +125,14 @@ enum ViewCommand {
         #[arg(long, requires = "rt_start")]
         rt_end: Option<f64>,
     },
-    /// Zoom a chromatogram and click accepted feature markers to inspect MS2 spectra
+    /// Navigate one mzXML/mzML file or a directory, with optional per-file audits and overlays
     Interactive {
         input: PathBuf,
-        audit: PathBuf,
+        /// Audit TSV for one raw file, or a directory mirroring the raw file hierarchy.
+        audit: Option<PathBuf>,
+        /// Override inferred feature lists with a TSV or a directory mirroring raw inputs.
+        #[arg(long)]
+        feature_list: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = ChromatogramKind::Tic)]
         kind: ChromatogramKind,
         #[arg(long)]
@@ -223,13 +237,15 @@ fn view(command: ViewCommand) -> Result<()> {
         ViewCommand::Interactive {
             input,
             audit,
+            feature_list,
             kind,
             mz,
             ppm,
             absolute_mz,
         } => explore::run(
             &input,
-            &audit,
+            audit.as_deref(),
+            feature_list.as_deref(),
             chromatogram_mode(kind, mz, ppm, absolute_mz)?,
         ),
         ViewCommand::Spectrum { input, scan } => {
@@ -313,6 +329,46 @@ fn discover(path: &Path, relative: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -
         }
     }
     Ok(())
+}
+
+fn listed_files(root: &Path, list: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let contents = fs::read_to_string(list)
+        .with_context(|| format!("reading --files-from {} (must be UTF-8)", list.display()))?;
+    let canonical_root =
+        fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))?;
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for (line, entry) in contents.lines().enumerate() {
+        let entry = entry.strip_suffix('\r').unwrap_or(entry);
+        ensure!(!entry.is_empty(), "empty --files-from path on line {}", line + 1);
+        let relative = PathBuf::from(entry);
+        ensure!(
+            !relative.is_absolute(),
+            "--files-from path must be relative: {entry}"
+        );
+        ensure!(
+            relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+            "--files-from path must not contain parent or current-directory components: {entry}"
+        );
+        ensure!(
+            is_ms(&relative),
+            "--files-from path must be mzXML/mzML: {entry}"
+        );
+        let path = root.join(&relative);
+        ensure!(path.is_file(), "--files-from path must be a file: {entry}");
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("resolving --files-from path {entry}"))?;
+        ensure!(
+            canonical.starts_with(&canonical_root),
+            "--files-from path is outside input root: {entry}"
+        );
+        ensure!(seen.insert(canonical), "duplicate --files-from path: {entry}");
+        files.push((path, relative));
+    }
+    ensure!(!files.is_empty(), "no mzXML/mzML files listed in {}", list.display());
+    Ok(files)
 }
 
 fn persist_mgf(
@@ -419,8 +475,16 @@ fn run(cli: Cli) -> Result<()> {
     };
     let mut files = Vec::new();
     if cli.input.is_dir() {
-        discover(&cli.input, Path::new(""), &mut files)?;
+        if let Some(list) = &cli.files_from {
+            files = listed_files(&cli.input, list)?;
+        } else {
+            discover(&cli.input, Path::new(""), &mut files)?;
+        }
     } else if cli.input.is_file() && is_ms(&cli.input) {
+        ensure!(
+            cli.files_from.is_none(),
+            "--files-from requires a directory input"
+        );
         files.push((
             cli.input.clone(),
             PathBuf::from(cli.input.file_name().context("input has no file name")?),
