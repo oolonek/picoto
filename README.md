@@ -2,7 +2,7 @@
 
 Picoto finds signals in a mass-spectrometry measurement and prepares them for comparison with reference collections. It does not identify chemicals or decide whether a signal came from a blank sample.
 
-The flock turns mass-spectrometry samples and measurements into traceable evidence for possible chemical matches; it can also export a knowledge graph. Picoto prepares measured signals for comparison. Start with the [flock overview](https://github.com/oolonek/flock-roadmap/blob/main/README.md) to see how the tools fit together.
+The flock turns mass-spectrometry samples and measurements into traceable evidence for possible chemical matches; it can also export a knowledge graph. Picoto prepares measured signals for comparison. Start with the [flock overview](https://github.com/oolonek/isla-gabriola-flock/blob/main/README.md) to see how the tools fit together.
 
 The name refers to the picoto, *Carcharhinus altimus* ([Wikidata Q1118043](https://www.wikidata.org/wiki/Q1118043); [Catalogue of Life R3MC](https://www.catalogueoflife.org/data/taxon/R3MC)), the bignose shark.
 
