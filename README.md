@@ -22,4 +22,6 @@ After the overview, follow the [processing guide](TECHNICAL.md#processing-raw-fi
 
 The [technical guide](TECHNICAL.md) covers feature selection, MS2 scan handling, output formats, terminal viewer controls, and verification limits.
 
+Picoto is available under either the [MIT license](LICENSE-MIT) or the [Apache 2.0 license](LICENSE-APACHE).
+
 *Naming note: For new species names, we take inspiration from [colonizer](https://crates.io/crates/colonizer)'s `inspire` mode, which suggests names from the Catalogue of Life, rather than inventing each crate name ourselves.*
