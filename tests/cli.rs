@@ -1,4 +1,6 @@
 use std::{fs, path::Path, process::Command};
+#[cfg(target_os = "linux")]
+use std::{io::Write, process::Stdio, thread, time::Duration};
 
 use base64::Engine;
 
@@ -264,8 +266,16 @@ fn files_from_rejects_invalid_lists_before_processing_any_file() {
     input(&outside, false, false);
     let invalid = [
         ("empty", String::new(), "no mzXML/mzML files"),
-        ("absolute", format!("run.mzXML\n{}\n", outside.display()), "relative"),
-        ("traversal", "run.mzXML\n../outside.mzXML\n".into(), "parent"),
+        (
+            "absolute",
+            format!("run.mzXML\n{}\n", outside.display()),
+            "relative",
+        ),
+        (
+            "traversal",
+            "run.mzXML\n../outside.mzXML\n".into(),
+            "parent",
+        ),
         ("duplicate", "run.mzXML\nrun.mzXML\n".into(), "duplicate"),
         ("unsupported", "run.mzXML\nnote.txt\n".into(), "mzXML/mzML"),
         ("directory", "run.mzXML\nfolder.mzXML\n".into(), "file"),
@@ -595,5 +605,142 @@ fn fwhm_is_blank_if_the_trace_never_falls_below_half_height() {
     assert_eq!(
         &rows[0][7], "",
         "a missing descending half-height crossing cannot be measured"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn process_viewer_input(raw: &Path, output: &Path) {
+    let processed = Command::new(env!("CARGO_BIN_EXE_picoto"))
+        .args([
+            raw.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--min-height",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        processed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&processed.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn viewer_screen(raw: &Path, audit: Option<&Path>, working_dir: &Path) -> String {
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let mut command = format!(
+        "stty cols 120 rows 40; {} view interactive {}",
+        quote(Path::new(env!("CARGO_BIN_EXE_picoto"))),
+        quote(raw)
+    );
+    if let Some(audit) = audit {
+        command.push(' ');
+        command.push_str(&quote(audit));
+    }
+    let mut child = Command::new("script")
+        .args(["-q", "-e", "-c", &command, "/dev/null"])
+        .current_dir(working_dir)
+        .env("TERM", "xterm")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(2));
+    child.stdin.take().unwrap().write_all(b"q").unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "viewer failed: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let bytes = result.stdout;
+    let mut screen = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 27 && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                index += 1;
+            }
+        } else if bytes[index].is_ascii() {
+            screen.push(char::from(bytes[index]));
+        }
+        index += 1;
+    }
+    screen
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn viewer_does_not_guess_audit_from_unselected_mato_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = temp.path().join("dataset/raw/sample.mzXML");
+    let output = temp.path().join("processed");
+    fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    input(&raw, false, false);
+    process_viewer_input(&raw, &output);
+    let config = temp.path().join("mato/config");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("another-job.toml"),
+        format!(
+            "[dataset]\nroot = {:?}\nms_dir = \"raw\"\n[picoto]\noutput_dir = {:?}\n",
+            raw.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .display()
+                .to_string(),
+            output.display().to_string()
+        ),
+    )
+    .unwrap();
+    let screen = viewer_screen(&raw, None, temp.path());
+    assert!(
+        screen.contains("|0acceptedfeatures"),
+        "raw-only viewer must not select another job's feature extraction: {screen}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn viewer_loads_explicit_nested_top_n_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw_dir = temp.path().join("dataset/raw");
+    let nested = raw_dir.join("batch");
+    let output = temp.path().join("top_n/250/picoto");
+    fs::create_dir_all(&nested).unwrap();
+    input(&nested.join("sample.mzXML"), false, false);
+    process_viewer_input(&raw_dir, &output);
+    let screen = viewer_screen(&raw_dir, Some(&output), temp.path());
+    assert!(
+        screen.contains("|1acceptedfeatures"),
+        "explicit nested output should load its audit: {screen}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn viewer_uses_adjacent_audit_without_job_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = temp.path().join("sample.mzXML");
+    let output = temp.path().join("processed");
+    input(&raw, false, false);
+    process_viewer_input(&raw, &output);
+    fs::copy(
+        output.join("sample_features.tsv"),
+        temp.path().join("sample_features.tsv"),
+    )
+    .unwrap();
+    fs::copy(
+        output.join("sample_feature_list.tsv"),
+        temp.path().join("sample_feature_list.tsv"),
+    )
+    .unwrap();
+    let screen = viewer_screen(&raw, None, temp.path());
+    assert!(
+        screen.contains("|1acceptedfeatures"),
+        "adjacent audit should load: {screen}"
     );
 }

@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::HashSet,
     ffi::OsString,
     fs, io,
@@ -17,124 +16,12 @@ pub(crate) struct MsFile {
     pub warning: Option<String>,
 }
 
-#[derive(Debug)]
-struct OutputMapping {
-    dataset_root: PathBuf,
-    raw_root: PathBuf,
-    output_root: PathBuf,
-}
-
-// Use the pipeline's existing raw/output mapping when running from the flock
-// checkout. Picoto remains usable alone with adjacent outputs or explicit paths.
-fn project_mappings() -> Result<Vec<OutputMapping>> {
-    let find_config = |path: &Path| {
-        path.ancestors()
-            .map(|ancestor| ancestor.join("mato/config"))
-            .find(|config| config.is_dir())
-    };
-    let cwd = std::env::current_dir().context("finding current directory")?;
-    let config = find_config(&cwd).or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|executable| find_config(&executable))
-    });
-    config.map_or(Ok(Vec::new()), |path| load_mappings(&path))
-}
-
-fn load_mappings(directory: &Path) -> Result<Vec<OutputMapping>> {
-    let mut paths = fs::read_dir(directory)
-        .with_context(|| format!("reading {}", directory.display()))?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<io::Result<Vec<_>>>()?;
-    paths.sort_unstable();
-    let mut mappings = Vec::new();
-    for path in paths {
-        if path.extension().is_none_or(|extension| extension != "toml") {
-            continue;
-        }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("reading configuration {}", path.display()))?;
-        let config: toml::Table = toml::from_str(&text)
-            .with_context(|| format!("parsing configuration {}", path.display()))?;
-        let Some((dataset, ms_dir, output)) = config.get("dataset").and_then(|dataset| {
-            Some((
-                dataset.get("root")?.as_str()?,
-                dataset.get("ms_dir")?.as_str()?,
-                config.get("picoto")?.get("output_dir")?.as_str()?,
-            ))
-        }) else {
-            continue;
-        };
-        let resolve = |name: &str| {
-            let name = Path::new(name);
-            if name.is_absolute() {
-                name.to_path_buf()
-            } else {
-                directory.join(name)
-            }
-        };
-        let dataset_root = resolve(dataset);
-        let raw_root = if Path::new(ms_dir).is_absolute() {
-            resolve(ms_dir)
-        } else {
-            dataset_root.join(ms_dir)
-        };
-        mappings.push(OutputMapping {
-            dataset_root,
-            raw_root,
-            output_root: resolve(output),
-        });
-    }
-    Ok(mappings)
-}
-
-fn matching_output(raw: &Path, mappings: &[OutputMapping]) -> Result<Option<PathBuf>> {
-    if mappings.is_empty() {
-        return Ok(None);
-    }
-    let absolute: Cow<'_, Path> = if raw.is_absolute() {
-        Cow::Borrowed(raw)
-    } else {
-        Cow::Owned(std::env::current_dir()?.join(raw))
-    };
-    let name = raw.file_stem().context("raw has no file stem")?;
-    let mut found = None;
-    for mapping in mappings {
-        if !absolute.starts_with(&mapping.dataset_root) {
-            continue;
-        }
-        let candidate = if let Ok(relative) = absolute.strip_prefix(&mapping.raw_root) {
-            mapping
-                .output_root
-                .join(suffixed(&relative.with_extension(""), "_features.tsv"))
-        } else {
-            mapping
-                .output_root
-                .join(suffixed(Path::new(name), "_features.tsv"))
-        };
-        if existing_file(&candidate, "audit")?.is_some() {
-            if found
-                .as_ref()
-                .is_some_and(|previous| previous != &candidate)
-            {
-                bail!(
-                    "multiple output directories contain an audit for {}; specify the output directory",
-                    raw.display()
-                );
-            }
-            found = Some(candidate);
-        }
-    }
-    Ok(found)
-}
-
-fn adjacent_or_mapped(raw: &Path, mappings: &[OutputMapping]) -> Result<Option<PathBuf>> {
+fn adjacent_audit(raw: &Path) -> Result<Option<PathBuf>> {
     let stem = Path::new(raw.file_stem().context("raw has no file stem")?);
-    let adjacent = raw.with_file_name(suffixed(stem, "_features.tsv"));
-    if let Some(path) = existing_file(&adjacent, "audit")? {
-        return Ok(Some(path));
-    }
-    matching_output(raw, mappings)
+    existing_file(
+        &raw.with_file_name(suffixed(stem, "_features.tsv")),
+        "audit",
+    )
 }
 
 fn named_mismatch(path: &Path, expected: &Path, suffix: &str, raw: &Path) -> Option<String> {
@@ -152,38 +39,11 @@ fn named_mismatch(path: &Path, expected: &Path, suffix: &str, raw: &Path) -> Opt
     })
 }
 
-/// Locate raw files and their optional, corresponding outputs without reading any MS data.
+/// Locate raw files and their optional, corresponding outputs without reading MS data.
 pub(crate) fn discover_files(
     input: &Path,
     audit: Option<&Path>,
     feature_list: Option<&Path>,
-) -> Result<Vec<MsFile>> {
-    let needs_mapping = audit.is_none()
-        || (input.is_file()
-            && audit.is_some_and(|path| {
-                input.file_stem().is_some_and(|stem| {
-                    named_mismatch(
-                        path,
-                        &suffixed(Path::new(stem), "_features.tsv"),
-                        "_features.tsv",
-                        input,
-                    )
-                    .is_some()
-                })
-            }));
-    let mappings = if needs_mapping {
-        project_mappings()?
-    } else {
-        Vec::new()
-    };
-    discover_files_with_mappings(input, audit, feature_list, &mappings)
-}
-
-fn discover_files_with_mappings(
-    input: &Path,
-    audit: Option<&Path>,
-    feature_list: Option<&Path>,
-    mappings: &[OutputMapping],
 ) -> Result<Vec<MsFile>> {
     let input_kind =
         fs::metadata(input).with_context(|| format!("checking input {}", input.display()))?;
@@ -232,14 +92,14 @@ fn discover_files_with_mappings(
             let path = audit.expect("validated explicit audit");
             if let Some(message) = named_mismatch(path, &expected_audit, "_features.tsv", &raw) {
                 warning = Some(message);
-                adjacent_or_mapped(&raw, mappings)?
+                adjacent_audit(&raw)?
             } else {
                 Some(path.to_path_buf())
             }
         } else if let Some(root) = audit {
             existing_file(&root.join(suffixed(&stem, "_features.tsv")), "audit")?
         } else {
-            adjacent_or_mapped(&raw, mappings)?
+            adjacent_audit(&raw)?
         };
         let selected_list = if list_is_file {
             let path = feature_list.expect("validated explicit feature list");
@@ -425,86 +285,6 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_named_audit_cannot_attach_another_samples_features() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let raw = temp.path().join("dataset/peak/other.mzML");
-        let outputs = temp.path().join("processed");
-        let wrong = outputs.join("sample_features.tsv");
-        let right = outputs.join("other_features.tsv");
-        touch(&raw)?;
-        touch(&wrong)?;
-        touch(&right)?;
-        touch(&outputs.join("other_feature_list.tsv"))?;
-        let mappings = [OutputMapping {
-            dataset_root: temp.path().join("dataset"),
-            raw_root: temp.path().join("dataset/peak"),
-            output_root: outputs.clone(),
-        }];
-        let files = discover_files_with_mappings(&raw, Some(&wrong), None, &mappings)?;
-        assert_eq!(files[0].audit.as_deref(), Some(right.as_path()));
-        assert!(
-            files[0]
-                .warning
-                .as_deref()
-                .unwrap()
-                .contains("sample_features.tsv")
-        );
-        assert!(files[0].warning.as_deref().unwrap().contains("other.mzML"));
-        Ok(())
-    }
-
-    #[test]
-    fn raw_only_finds_accepted_features_under_configured_output_root() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dataset = temp.path().join("dataset");
-        let raw = dataset.join("ccms_peak/peak/sample.mzML");
-        let outputs = temp.path().join("processed");
-        let audit = outputs.join("sample_features.tsv");
-        let list = outputs.join("sample_feature_list.tsv");
-        touch(&raw)?;
-        touch(&audit)?;
-        touch(&list)?;
-        let mappings = [OutputMapping {
-            dataset_root: dataset.clone(),
-            raw_root: dataset.join("peak/peak"),
-            output_root: outputs,
-        }];
-        let files = discover_files_with_mappings(&raw, None, None, &mappings)?;
-        assert_eq!(files[0].audit.as_deref(), Some(audit.as_path()));
-        assert_eq!(files[0].feature_list.as_deref(), Some(list.as_path()));
-        assert!(files[0].warning.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn pipeline_config_maps_nested_raw_files_to_processed_outputs() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dataset = temp.path().join("dataset");
-        let raw = dataset.join("peak/peak/sub/sample.mzML");
-        let outputs = temp.path().join("processed");
-        let audit = outputs.join("sub/sample_features.tsv");
-        let list = outputs.join("sub/sample_feature_list.tsv");
-        let configs = temp.path().join("mato/config");
-        touch(&raw)?;
-        touch(&audit)?;
-        touch(&list)?;
-        fs::create_dir_all(&configs)?;
-        fs::write(
-            configs.join("massive.toml"),
-            format!(
-                "# pipeline output mapping\n[dataset]\nroot = {:?}\nms_dir = \"peak/peak\"\n[picoto]\noutput_dir = {:?}\n",
-                dataset.display().to_string(),
-                outputs.display().to_string(),
-            ),
-        )?;
-        let mappings = load_mappings(&configs)?;
-        let files = discover_files_with_mappings(&raw, None, None, &mappings)?;
-        assert_eq!(files[0].audit.as_deref(), Some(audit.as_path()));
-        assert_eq!(files[0].feature_list.as_deref(), Some(list.as_path()));
-        Ok(())
-    }
-
-    #[test]
     fn mismatched_feature_list_is_warned_and_matching_list_is_used() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let raw = temp.path().join("sample.mzML");
@@ -515,7 +295,7 @@ mod tests {
         touch(&audit)?;
         touch(&list)?;
         touch(&wrong)?;
-        let files = discover_files_with_mappings(&raw, Some(&audit), Some(&wrong), &[])?;
+        let files = discover_files(&raw, Some(&audit), Some(&wrong))?;
         assert_eq!(files[0].feature_list.as_deref(), Some(list.as_path()));
         assert!(
             files[0]
@@ -534,7 +314,7 @@ mod tests {
         let wrong = temp.path().join("other_features.tsv");
         touch(&raw)?;
         touch(&wrong)?;
-        let files = discover_files_with_mappings(&raw, Some(&wrong), None, &[])?;
+        let files = discover_files(&raw, Some(&wrong), None)?;
         assert!(files[0].audit.is_none());
         assert!(files[0].feature_list.is_none());
         assert!(files[0].warning.is_some());
